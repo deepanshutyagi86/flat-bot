@@ -1,0 +1,333 @@
+# 🏠 FlatBot — WhatsApp Flat Finder Bot
+
+A WhatsApp bot for Indian housing communities that lets people **post, search, and inquire about flat listings** — all without exposing anyone's phone number until they explicitly consent.
+
+---
+
+## 💡 The Idea
+
+In most Delhi/NCR housing groups, people spam the group with flat listings, numbers get leaked, and there's no way to search old posts. FlatBot solves this:
+
+- Members post listings through the bot → goes into a database with a unique ID
+- Anyone can search using natural language (powered by Gemini AI)
+- Interested people send the listing ID → bot asks the owner if they want to share their number
+- Owner says YES → number revealed. Owner says NO → requester gets declined. **Number stays private by default.**
+
+---
+
+## 🗂️ Project Structure
+
+```
+WPBACKEND/
+├── server.js              # Entry point
+├── routes/
+│   └── webhook.js         # All message handling logic (brain of the bot)
+├── services/
+│   ├── whatsapp.js        # WhatsApp client setup & event listeners
+│   └── search.js          # AI search using Gemini API
+├── database/
+│   └── db.js              # Supabase database queries
+└── .env                   # API keys & config
+```
+
+---
+
+## ⚙️ Tech Stack
+
+| Layer | Tool |
+|---|---|
+| WhatsApp connection | `whatsapp-web.js` (Puppeteer-based) |
+| Database | Supabase (PostgreSQL) |
+| AI search | Google Gemini 2.5 Flash |
+| Runtime | Node.js |
+
+---
+
+## 🔑 Environment Variables (`.env`)
+
+```env
+SUPABASE_URL=your_supabase_project_url
+SUPABASE_KEY=your_supabase_anon_key
+GEMINI_API_KEY=your_google_gemini_api_key
+SOCIAL_GROUP_ID=120363XXXXXXXXXX@g.us     # WhatsApp group where members chat
+ANNOUNCEMENT_GROUP_ID=120363XXXXXXXXXX@g.us  # WhatsApp group for official listing posts
+```
+
+---
+
+## 🗄️ Database Schema
+
+Single table in Supabase: **`listings`**
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | text (PK) | Auto-generated ID like `NC-0001` |
+| `owner_phone` | text | Sender's phone number (no country display) |
+| `message_text` | text | The full listing text |
+| `source` | text | `"direct"` (DM) or `"group"` (from social group) |
+| `status` | text | `"active"` or `"inactive"` |
+| `created_at` | timestamp | Auto by Supabase |
+
+---
+
+## 📖 How It Works — Full Flow
+
+### 1. Bot Startup (`server.js`)
+
+```
+server.js
+  → init(sendMessage)       passes the send function to webhook
+  → connectWhatsApp(...)    boots the WhatsApp client
+```
+
+The bot scans a QR code on first run and saves the session via `LocalAuth` so it doesn't need to scan again.
+
+---
+
+### 2. WhatsApp Events (`services/whatsapp.js`)
+
+The WhatsApp client listens for 3 events:
+
+**`qr`** → Prints QR code in terminal for scanning
+
+**`group_join`** → When someone joins the group, bot DMs them a welcome message explaining how to use it
+
+**`message`** → Every incoming message:
+- Skips `status@broadcast`
+- If message is from `SOCIAL_GROUP_ID` → calls `handleGroupMessage()`
+- If message is a private DM → calls `handleMessage()`
+- Resolves sender's actual phone number via `getContact()` with fallback parsing
+
+---
+
+### 3. Message Routing (`routes/webhook.js`)
+
+This is the brain. Every incoming message goes through `handleMessage()` which checks cases in order:
+
+```
+message received
+    │
+    ├── user in group confirm flow?     → handleGroupMessage()
+    ├── "post"                          → ask for listing text
+    ├── state = awaiting_listing        → save to DB + post to announcements
+    ├── "DELETE XX-0000"                → verify ownership + soft delete
+    ├── "search [query]"                → explicit AI search
+    ├── "XX-0000" (listing ID)          → inquiry flow (ping owner)
+    ├── state = awaiting_approval       → owner says YES/NO
+    ├── simple greeting (hi/hello/hey)  → welcome message (no AI call)
+    ├── natural language (>3 words)     → AI search
+    └── anything else                   → help message
+```
+
+#### State Machine
+
+The bot tracks per-user state in memory (`userState` object):
+
+| State | Meaning |
+|---|---|
+| `awaiting_listing` | User sent "post", waiting for their listing text |
+| `awaiting_group_confirm` | User posted in group, bot asked if they want it officially listed |
+| `awaiting_approval` | Owner received an inquiry, waiting for YES/NO |
+
+> ⚠️ State is stored in-memory. If the server restarts, active states are lost and users need to restart their flow.
+
+---
+
+### 4. Posting a Listing
+
+**Via DM:**
+1. User sends `post`
+2. Bot sets state `awaiting_listing`, asks for listing text
+3. User sends their listing
+4. Bot saves to DB with unique ID, posts to Announcements group
+
+**Via Social Group:**
+1. User posts a message in the social group containing flat-related keywords
+2. Bot detects it using `isFlatListing()` keyword check
+3. Bot DMs the user asking if they want it officially posted
+4. User replies YES → saved to DB + posted to Announcements
+
+---
+
+### 5. Searching Listings
+
+**Explicit:** `search 2bhk rohini under 10k`
+
+**Natural language:** `looking for flat near north campus for girls under 12000`
+
+Both go through `doSearch()`:
+
+```
+doSearch()
+  → fetch ALL active listings from DB (no filter)
+  → pass query + listings to aiSearch()
+  → Gemini returns matching IDs as JSON
+  → filter listings by matched IDs
+  → send results to user
+```
+
+#### AI Search Logic (`services/search.js`)
+
+Sends Gemini a prompt with:
+- The user's query
+- All active listings (as `ID: NC-0001\nListing: [text]` blocks)
+
+Gemini returns one of:
+```json
+{ "type": "results", "ids": ["NC-0001", "NC-0005"] }
+{ "type": "results", "ids": [] }
+{ "type": "off_topic" }
+```
+
+The bot handles:
+- `results` → show matched listings
+- `off_topic` → tell user the bot only does flat stuff
+- `quota_exceeded` (HTTP 429) → tell user AI is down, suggest manual search
+
+Gemini understands:
+- Indian price shorthand: `10k` = ₹10,000
+- Local areas: `north campus` = near Delhi University
+- Gender preferences, BHK types, furnishing
+
+---
+
+### 6. Inquiry Flow (Privacy System)
+
+```
+User sends: NC-0001
+  → fetch listing from DB
+  → check: listing exists? active? not owner's own listing?
+  → DM the owner: "someone's interested, share number? YES/NO"
+  → set owner's state to awaiting_approval
+  → tell requester to wait
+
+Owner replies YES:
+  → send requester the owner's phone number
+  → clear both states
+
+Owner replies NO:
+  → tell requester it was declined
+  → clear both states
+```
+
+This is the **core privacy feature** — numbers are never shared without consent.
+
+---
+
+### 7. Deleting a Listing
+
+User sends: `DELETE NC-0001`
+
+Bot checks:
+1. Listing exists?
+2. Does the requester's phone match `owner_phone`? (only owner can delete)
+3. Is it already inactive?
+
+If all good → sets `status = "inactive"` (soft delete, not actually removed from DB).
+
+---
+
+### 8. ID Generation (`database/db.js`)
+
+```js
+generateNextID()
+  → fetch all existing IDs
+  → parse numbers from "NC-XXXX"
+  → return max + 1, zero-padded to 4 digits
+```
+
+Has retry logic (up to 3 attempts) to handle race conditions on duplicate keys.
+
+---
+
+## 🔁 Data Flow Diagram
+
+```
+User (WhatsApp)
+    │
+    ▼
+whatsapp.js  ──────────────────────────────────────┐
+(event listener)                                   │
+    │                                              │
+    ▼                                              │
+webhook.js                                         │
+(state machine + routing)                          │
+    │                   │                          │
+    ▼                   ▼                          │
+db.js              search.js                       │
+(Supabase)         (Gemini AI)                     │
+    │                   │                          │
+    └───────────────────┘                          │
+    │                                              │
+    ▼                                              │
+sendMessage() ─────────────────────────────────────┘
+(reply to user)
+```
+
+---
+
+## 🚀 Setup & Running
+
+### Prerequisites
+
+- Node.js 18+
+- A Supabase project with the `listings` table
+- Google Gemini API key
+- A WhatsApp number for the bot
+
+### Install
+
+```bash
+npm install
+```
+
+### Run
+
+```bash
+node server.js
+```
+
+Scan the QR code with the bot's WhatsApp account. Session is saved locally — next run connects automatically.
+
+### Key npm packages
+
+```json
+"whatsapp-web.js"   // WhatsApp automation via Puppeteer
+"@supabase/supabase-js"  // Database client
+"qrcode-terminal"   // Print QR in terminal
+"dotenv"            // Load .env vars
+```
+
+---
+
+## ⚠️ Known Limitations
+
+| Issue | Detail |
+|---|---|
+| In-memory state | `userState` resets on server restart; active flows break |
+| ID generation race condition | Handled with 3 retries but not perfectly atomic |
+| Gemini quota | Free tier has limits; bot degrades gracefully with a help message |
+| WhatsApp session | Uses `LocalAuth` — session files stored locally, not cloud |
+| No pagination | All active listings sent to Gemini at once; could hit token limits if listings grow large |
+
+---
+
+## 💬 Bot Commands Reference
+
+| Command | What it does |
+|---|---|
+| `post` | Start posting a listing |
+| `search [query]` | Search listings with keywords |
+| `[any sentence >3 words]` | Auto AI search |
+| `NC-0001` | Inquire about a listing |
+| `DELETE NC-0001` | Delete your own listing |
+| `hi` / `hello` | Welcome message |
+
+---
+
+## 👤 Author
+
+Built by Deepanshu Tyagi for a Delhi housing community.  
+Boss is surviving on chai. Help him out 😭  
+UPI: `deepanshutyagi0784@okhdfcbank`  
+Contact: `+91 9870600903`
