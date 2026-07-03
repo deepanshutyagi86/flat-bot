@@ -139,15 +139,33 @@ async function connectWhatsApp(onMessage, onGroupMessage, onReady) {
       try {
         if (msg.fromMe) {
           // Use msg.to first, fall back to msg.id.remote
-          const target = msg.to || msg.id?.remote;
+          let target = msg.to || msg.id?.remote;
           console.log(`[fromMe cmd] body="${body}" from=${msg.from} to=${msg.to} id.remote=${msg.id?.remote} resolved=${target}`);
           if (!target) {
             console.error("[fromMe cmd] could not resolve target chatId — skipping");
             return;
           }
+        
+          // CRITICAL FIX: If target is in @lid format, resolve it to phone (@c.us) format
+          // so it matches the chatId used when the user sends messages.
+          if (target.endsWith("@lid")) {
+            try {
+              const chat = await client.getChatById(target);
+              const contact = await chat.getContact();
+              if (contact?.id?._serialized && contact.id._serialized.endsWith("@c.us")) {
+                console.log(`[fromMe cmd] LID resolved: ${target} → ${contact.id._serialized}`);
+                target = contact.id._serialized;
+              }
+            } catch (err) {
+              console.error("[fromMe cmd] LID resolution failed:", err.message);
+              // continue with lid anyway — better than nothing
+            }
+          }
+        
           chatId = target;
           sender = target
             .replace("@c.us", "")
+            .replace("@lid", "")
             .replace("@s.whatsapp.net", "");
         } else {
           const contact = await msg.getContact();
